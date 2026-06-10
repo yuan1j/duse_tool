@@ -85,6 +85,39 @@ class DashscopeClient:
             logger.error("Dashscope 调用失败: %s", msg)
             raise RuntimeError(f"AI 服务调用失败: {msg}")
 
+    def chat(self, messages, use_fast=True, max_tokens=1024):
+        """带历史的对话调用 - messages 为列表，每项 {'role': 'user'|'assistant', 'content': str}
+
+        system_prompt 若存在应放入 messages 首条 (role='system')。"""
+        if not self.enabled or self._dashscope is None:
+            raise RuntimeError("Dashscope 客户端未正确初始化")
+
+        model = self.fast_model if use_fast else self.model
+        if not messages:
+            raise RuntimeError("对话消息不能为空")
+
+        try:
+            Generation = self._dashscope.Generation
+            response = Generation.call(
+                model=model,
+                messages=list(messages),
+                result_format='message',
+                max_tokens=max_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+            )
+            if response.status_code == 200 and response.output:
+                choices = response.output.get("choices", [])
+                if choices and len(choices) > 0:
+                    content = choices[0]["message"]["content"].strip()
+                    if content:
+                        return content
+            logger.error("Dashscope 对话返回异常: status=%s", getattr(response, 'status_code', 'N/A'))
+            raise RuntimeError(f"AI 对话服务返回异常")
+        except Exception as e:
+            logger.error("Dashscope 对话调用失败: %s", str(e))
+            raise RuntimeError(f"AI 对话服务调用失败: {e}")
+
 
 class AIHelper:
     """AI 辅助模块 - 所有功能必须使用 Dashscope 大模型"""
@@ -457,6 +490,259 @@ class AIHelper:
             return self.client.enabled
         except Exception:
             return False
+
+    # ============================================================
+    #  多轮对话式一键填报（用户确认后才填报）
+    # ============================================================
+
+    def build_conversation_system_prompt(self, fields, form_name=None):
+        field_lines = []
+        for idx, f in enumerate(fields, 1):
+            label = f.get("field_label", "")
+            fname = f.get("field_name", "")
+            ftype = f.get("field_type", "text")
+            required = "必填" if f.get("is_required") else "选填"
+            desc = f.get("field_description") or ""
+            options = f.get("field_options")
+            options_str = ""
+            if options:
+                options_str = f"，可选值：{'、'.join(options)}"
+            field_lines.append(
+                f"{idx}. 字段标签='{label}'（字段名={fname}，{required}，类型：{ftype}{options_str}）{(' - ' + desc) if desc else ''}"
+            )
+        form_info = f"【{form_name}】" if form_name else ""
+        # 构建一个示例 JSON 模板，用前 3 个字段的 label 作为 key
+        example_keys = [f'"{f.get("field_label", "")}"' for f in fields[:3]]
+        json_template = "{" + ", ".join([f"{k}: \"<value>\"" for k in example_keys]) + "}"
+        return (
+            f"你是一个专业的表单填报助手。你将帮助用户通过多轮对话完成表单{form_info}的填写。\n\n"
+            "============================================================\n"
+            "表单字段（非常重要：下面列出的每个字段的「字段标签」必须作为 JSON 的 key，原样使用，不可更改大小写、不可增减空格、不可用其他名称替代）：\n"
+            "============================================================\n"
+            + "\n".join(field_lines) + "\n\n"
+            "============================================================\n"
+            "【必须遵守的回复格式】\n"
+            "============================================================\n"
+            "每次回复必须严格包含以下两部分，两部分之间用一个空行分隔：\n\n"
+            "【第一部分】对用户说的自然语言（友好对话部分）。\n"
+            "   - 可以是：询问某个字段的值、确认已收到的信息、或让用户确认结束。\n"
+            "   - 这部分不要包含任何 JSON、字段列表、或 \"标签：值\" 格式的键值对。\n\n"
+            "【第二部分】一个合法的 JSON 对象（必须放在回复的最后部分）：\n"
+            "   - JSON 必须用 { 开头，用 } 结束。\n"
+            "   - JSON 中的每个 key 必须严格等于上面列出的「字段标签」，不能改动任何字符。\n"
+            "   - JSON 中的 value 是从用户本次对话中解析出来的字段值；如果本次没有解析到某个字段，就不要包含它。\n"
+            "   - 字符串值必须用双引号括起来。\n"
+            "   - 所有 key 必须用双引号括起来。\n"
+            "   - 如果本次没有解析到任何字段值，则输出 {}。\n\n"
+            f"正确的 JSON 示例（假设表单前几个字段用 field_label 作 key）：\n"
+            f"  {json_template}\n\n"
+            "其他规则：\n"
+            "1. 如果用户一次性提供了多个字段，请全部解析并写入同一个 JSON 对象。\n"
+            "2. 对下拉选择（select）类型字段，从可选值中挑选最接近的一个。\n"
+            "3. 对日期类型字段，请解析为 YYYY-MM-DD 格式。\n"
+            "4. 对数字类型字段，仅保留数字部分。\n"
+            "5. 当所有必填字段都有值后，或用户明确说完成/确认，请在自然语言末尾或 JSON 之前输出特殊标记 <<DONE>>。\n"
+            "============================================================\n"
+        )
+
+    def start_conversation_fill(self, fields, form_name=None, existing_values=None):
+        """开启对话式填报会话，返回首个回复（ai_message, updated_values）"""
+        values = dict(existing_values or {})
+        system_prompt = self.build_conversation_system_prompt(fields, form_name)
+        first_user_msg = "我想要通过对话填写这个表单，请开始询问我。"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": first_user_msg},
+        ]
+        return self._run_conversation_step(messages, fields, values,
+                                           _return_messages=[{"role": "user", "content": first_user_msg}])
+
+    def continue_conversation_fill(self, messages, fields, user_input, existing_values=None):
+        """继续对话：传入历史 messages（不含 system 的用户/助手消息列表）与用户新输入，
+
+        返回 (ai_message, updated_values, done_flag, new_messages)"""
+        messages = list(messages) + [{"role": "user", "content": user_input}]
+        system_prompt = self.build_conversation_system_prompt(fields)
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        return self._run_conversation_step(full_messages, fields, values=dict(existing_values or {}), _return_messages=messages)
+
+    def _run_conversation_step(self, full_messages, fields, values, _return_messages=None):
+        ai_text = self.client.chat(full_messages, use_fast=True, max_tokens=1500)
+        done = "<<DONE>>" in ai_text
+        ai_text_clean = ai_text.replace("<<DONE>>", "").strip()
+        display_text_for_user = ai_text_clean
+        parsed_json = {}
+
+        # ==================== 调试日志 ====================
+        print(f"\n[AI-conv] ---- Step start ----")
+        print(f"[AI-conv] Input fields: {len(fields)}")
+        for _f in fields:
+            print(f"  field_name='{_f.get('field_name')}'  field_label='{_f.get('field_label')}'  type={_f.get('field_type')}")
+        print(f"[AI-conv] AI text length: {len(ai_text_clean)}")
+        print(f"[AI-conv] AI text (first 200): {ai_text_clean[:200]}")
+        # ===================================================
+
+        # --- 策略一：多种 JSON 提取策略，逐一尝试 ---
+        json_strategies = [
+            ("greedy  { ... }",         r'\{[\s\S]*\}'),           # 最外层大括号（贪心）
+            ("non-greedy { ... }",      r'\{[\s\S]*?\}'),          # 第一个完整 {} 对
+        ]
+        json_candidate = None
+        json_span = None
+        for sname, spat in json_strategies:
+            try:
+                m = re.search(spat, ai_text_clean)
+                if m:
+                    cand = m.group(0).strip()
+                    try:
+                        data = json.loads(cand)
+                        if isinstance(data, dict) and data:
+                            json_candidate = data
+                            json_span = (m.start(), m.end())
+                            print(f"[AI-conv] JSON via '{sname}': {len(data)} keys")
+                            print(f"[AI-conv] JSON keys: {list(data.keys())}")
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        if json_candidate:
+            parsed_json = json_candidate
+            # 从对用户说的话中去掉 JSON 部分（保留前面的自然语言）
+            before_json = ai_text_clean[:json_span[0]].strip()
+            if before_json:
+                display_text_for_user = before_json
+            else:
+                display_text_for_user = "已成功解析您提供的信息。"
+        else:
+            print("[AI-conv] No valid JSON found in AI reply. Trying fallback label:value parser.")
+
+            # --- 策略二：后备解析，从 "标签：值" 列表行提取 ---
+            fallback = {}
+            field_label_to_field = {}
+            for f in fields:
+                lb = (f.get("field_label") or "").strip()
+                fn = (f.get("field_name") or "").strip()
+                if lb:
+                    field_label_to_field[lb] = f
+                if fn and fn != lb:
+                    field_label_to_field[fn] = f
+
+            for raw_line in ai_text_clean.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("{") or line.startswith("}"):
+                    continue
+                m = re.match(r'^([^：:]{1,50})\s*[：:]\s*(.+)$', line)
+                if not m:
+                    continue
+                raw_key = m.group(1).strip()
+                raw_val = m.group(2).strip()
+                raw_key_clean = re.sub(r'^[\d\.\s\-\*\【\]]+', '', raw_key).strip()
+                matched_field = None
+                for lb_cand, f_obj in field_label_to_field.items():
+                    if lb_cand and (raw_key_clean == lb_cand or raw_key_clean.startswith(lb_cand)):
+                        matched_field = f_obj
+                        break
+                if matched_field is None:
+                    for lb_cand, f_obj in field_label_to_field.items():
+                        if lb_cand and (lb_cand in raw_key_clean or raw_key_clean in lb_cand):
+                            matched_field = f_obj
+                            break
+                if matched_field is not None:
+                    key_for_merge = matched_field.get("field_label") or matched_field.get("field_name")
+                    fallback[key_for_merge] = raw_val.strip(" ,，;；\"'")
+
+            if fallback:
+                parsed_json = fallback
+                print(f"[AI-conv] Fallback label:value parser found {len(fallback)} values")
+                kept = []
+                for l in ai_text_clean.splitlines():
+                    if not re.match(r'^[^\n：:]{1,50}\s*[：:]\s*.+$', l.strip()):
+                        kept.append(l)
+                if kept:
+                    display_text_for_user = "\n".join(kept).strip()
+                else:
+                    display_text_for_user = "已收到您提供的信息。"
+            else:
+                print("[AI-conv] Fallback parser also found nothing.")
+
+        # --- 关键修复：字段 key 匹配（大小写不敏感 + 空白规范化）---
+        def _norm(s):
+            if not s:
+                return ""
+            s = str(s).strip().lower()
+            s = re.sub(r'\s+', ' ', s)
+            return s
+
+        updated_values = dict(values) if values else {}
+        # 建立规范化后的查找表（同时支持 field_name 和 field_label）
+        norm_map = {}
+        for f in fields:
+            fl = _norm(f.get("field_label", ""))
+            fn = _norm(f.get("field_name", ""))
+            if fl:
+                norm_map[fl] = f
+            if fn and fn != fl:
+                norm_map[fn] = f
+
+        matched_count = 0
+        unmatched_keys = []
+        for key, raw_val in parsed_json.items():
+            if raw_val is None or (isinstance(raw_val, str) and not str(raw_val).strip()):
+                continue
+            nkey = _norm(key)
+            target_field = norm_map.get(nkey)
+            if target_field is None:
+                # 二次尝试：模糊子串匹配
+                for nlabel, fld in norm_map.items():
+                    if nlabel and nkey and (nlabel in nkey or nkey in nlabel):
+                        target_field = fld
+                        break
+            if target_field is None:
+                unmatched_keys.append(key)
+                continue
+            fn = target_field["field_name"]
+            ftype = target_field.get("field_type", "text")
+            opts = target_field.get("field_options")
+            try:
+                cleaned = self._clean_output(str(raw_val), ftype, opts)
+            except Exception:
+                cleaned = str(raw_val).strip()
+            if cleaned:
+                updated_values[fn] = cleaned
+                matched_count += 1
+                print(f"[AI-conv]  ✓ key='{key}' → field_name='{fn}' (label='{target_field.get('field_label')}') value='{cleaned}'")
+
+        if unmatched_keys:
+            print(f"[AI-conv]  ✗ Unmatched JSON keys: {unmatched_keys}")
+        print(f"[AI-conv] Step result: matched={matched_count}/{len(parsed_json)} JSON keys, updated_values has {len(updated_values)} entries")
+        print(f"[AI-conv] updated_values keys: {list(updated_values.keys())}")
+
+        # --- 构造返回 messages ---
+        new_messages = list(_return_messages) if _return_messages is not None else []
+        display_text = display_text_for_user.strip()
+        if not display_text:
+            display_text = "已收到您的信息，请继续或确认结束。"
+        new_messages.append({"role": "assistant", "content": display_text})
+
+        print(f"[AI-conv] ---- Step end ----\n")
+        return display_text, updated_values, done, new_messages
+
+    def finalize_conversation_fill(self, fields, values):
+        """用户确认后，将解析的值补齐为完整填报数据，缺省值或合理推荐补全（不强制）。
+
+        返回最终的 submission_data（仅填充已解析的字段；未解析到的为空字符串）。"""
+        submission_data = {}
+        for f in fields:
+            fn = f.get("field_name")
+            if not fn:
+                continue
+            if fn in values and values[fn] not in ("", None):
+                submission_data[fn] = values[fn]
+            else:
+                submission_data[fn] = ""
+        return submission_data
 
     # ============================================================
     #  LLM 输出清理 - 确保返回干净、可用的值

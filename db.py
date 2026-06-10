@@ -19,13 +19,21 @@ class DatabaseManager:
 
     @contextmanager
     def _get_connection(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA foreign_keys=ON")
             yield conn
             conn.commit()
         except Exception as e:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             raise e
         finally:
             conn.close()
@@ -80,8 +88,6 @@ class DatabaseManager:
                     created_at TEXT NOT NULL
                 )
             """)
-
-            cursor.execute("PRAGMA foreign_keys = ON")
 
     def create_form(self, name, description=None):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

@@ -210,6 +210,50 @@ class FormManager:
             raise ValueError("字段不存在")
         return ai_helper.get_suggestions(field, count)
 
+    # ============================================================
+    #  多轮对话式一键填报
+    # ============================================================
+
+    def start_conversation_fill(self, form_id, existing_values=None):
+        form = self.db.get_form(form_id)
+        if not form:
+            raise ValueError("表单不存在")
+        fields = self.db.get_fields_by_form(form_id)
+        if not fields:
+            raise ValueError("该表单暂无可填字段")
+        ai_message, values, done, new_messages = ai_helper.start_conversation_fill(
+            fields, form_name=form.get("name"), existing_values=existing_values
+        )
+        return {
+            "form": form,
+            "fields": fields,
+            "ai_message": ai_message,
+            "values": values,
+            "done": done,
+            "messages": new_messages,
+        }
+
+    def continue_conversation_fill(self, form_id, messages, user_input, existing_values=None):
+        fields = self.db.get_fields_by_form(form_id)
+        if not fields:
+            raise ValueError("该表单暂无可填字段")
+        ai_message, values, done, new_messages = ai_helper.continue_conversation_fill(
+            messages, fields, user_input, existing_values=existing_values
+        )
+        return {
+            "fields": fields,
+            "ai_message": ai_message,
+            "values": values,
+            "done": done,
+            "messages": new_messages,
+        }
+
+    def finalize_conversation_fill(self, form_id, values):
+        fields = self.db.get_fields_by_form(form_id)
+        if not fields:
+            raise ValueError("该表单暂无可填字段")
+        return ai_helper.finalize_conversation_fill(fields, values)
+
     def save_form_as_template(self, form_id, template_name):
         if not template_name or not template_name.strip():
             raise ValueError("模板名称不能为空")
